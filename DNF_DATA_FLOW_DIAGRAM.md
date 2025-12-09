@@ -102,13 +102,13 @@ flowchart TB
     TRANS_ITEMS --> TRANS_END
     TRANS_END -->|"persists"| HISTORY_DB
 
-    %% Styling with high-contrast colors for Dark/Light mode compatibility
-    classDef remote fill:#bbdefb,stroke:#0d47a1,stroke-width:2px,color:#000
-    classDef config fill:#ffe0b2,stroke:#e65100,stroke-width:2px,color:#000
-    classDef cache fill:#c8e6c9,stroke:#1b5e20,stroke-width:2px,color:#000
-    classDef memory fill:#e1bee7,stroke:#4a148c,stroke-width:2px,color:#000
-    classDef db fill:#f8bbd0,stroke:#880e4f,stroke-width:2px,color:#000
-    classDef auth fill:#ffccbc,stroke:#bf360c,stroke-width:2px,color:#000
+    %% Styling - Dark Mode Optimized
+    classDef remote fill:#1a237e,stroke:#4fc3f7,color:#e1f5fe
+    classDef config fill:#e65100,stroke:#ffcc80,color:#fff3e0
+    classDef cache fill:#1b5e20,stroke:#a5d6a7,color:#e8f5e9
+    classDef memory fill:#4a148c,stroke:#ce93d8,color:#f3e5f5
+    classDef db fill:#880e4f,stroke:#f48fb1,color:#fce4ec
+    classDef auth fill:#263238,stroke:#b0bec5,color:#eceff1
 
     class CDN,REPOMD,PRIMARY,RPMS remote
     class REPOFILE,CERTS config
