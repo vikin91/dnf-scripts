@@ -158,9 +158,9 @@ flowchart LR
                                       ▼
   ┌──────────────────────────────────────────────────────────────────────────┐
   │  CREATES:                                                                │
-  │    /etc/yum.repos.d/redhat.repo     ← Repository URLs                   │
-  │    /etc/pki/consumer/cert.pem       ← System identity                   │
-  │    /etc/pki/entitlement/*.pem       ← Subscription proof                │
+  │    /etc/yum.repos.d/redhat.repo     ← Repository URLs                    │
+  │    /etc/pki/consumer/cert.pem       ← System identity                    │
+  │    /etc/pki/entitlement/*.pem       ← Subscription proof                 │
   └──────────────────────────────────────────────────────────────────────────┘
                                       │
                                       ▼
@@ -183,12 +183,12 @@ flowchart LR
            │         └───────────────────────────────────────┘            │
            │                                                              │
            ▼                                                              ▼
-  ┌──────────────────────────────────────────────────────────────────────────┐
-  │                          DNF / libdnf                                    │
-  │                                                                          │
-  │   base.read_all_repos()     base.fill_sack()                             │
-  │          │                        │                                      │
-  │          ▼                        ▼                                      │
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                          DNF / libdnf                                   │
+  │                                                                         │
+  │   base.read_all_repos()     base.fill_sack()                            │
+  │          │                        │                                     │
+  │          ▼                        ▼                                     │
   │   ┌─────────────┐          ┌─────────────────────────────────────────┐  │
   │   │ Repo Config │          │              SACK (in-memory)           │  │
   │   │ - repo IDs  │          │  ┌─────────────────┐ ┌────────────────┐ │  │
@@ -237,15 +237,15 @@ flowchart LR
   │                    /var/lib/dnf/history.sqlite                           │
   │  ────────────────────────────────────────────────────────────────────    │
   │                                                                          │
-  │   ┌─────────────┐    ┌─────────────────┐    ┌────────────────────────┐  │
-  │   │ trans       │    │ rpm             │    │ trans_item             │  │
-  │   │ ─────────── │    │ ─────────────── │    │ ────────────────────── │  │
-  │   │ id          │    │ item_id         │    │ trans_id               │  │
-  │   │ dt_begin    │◀──▶│ name            │◀──▶│ item_id                │  │
-  │   │ dt_end      │    │ epoch           │    │ repoid = "rhel-9-base" │  │
-  │   │ cmdline     │    │ version         │    │ action = INSTALL       │  │
-  │   │ loginuid    │    │ release         │    │ reason = USER          │  │
-  │   └─────────────┘    │ arch            │    └────────────────────────┘  │
+  │   ┌─────────────┐    ┌─────────────────┐    ┌────────────────────────┐   │
+  │   │ trans       │    │ rpm             │    │ trans_item             │   │
+  │   │ ─────────── │    │ ─────────────── │    │ ────────────────────── │   │
+  │   │ id          │    │ item_id         │    │ trans_id               │   │
+  │   │ dt_begin    │◀──▶│ name            │◀──▶│ item_id                │   │
+  │   │ dt_end      │    │ epoch           │    │ repoid = "rhel-9-base" │   │
+  │   │ cmdline     │    │ version         │    │ action = INSTALL       │   │
+  │   │ loginuid    │    │ release         │    │ reason = USER          │   │
+  │   └─────────────┘    │ arch            │    └────────────────────────┘   │
   │                      └─────────────────┘                                 │
   │                                                                          │
   └──────────────────────────────────────────────────────────────────────────┘
@@ -286,7 +286,7 @@ Before DNF can access Red Hat repositories, the system must be registered. This 
   │                    FILES CREATED BY REGISTRATION                         │
   ├──────────────────────────────────────────────────────────────────────────┤
   │                                                                          │
-  │  /etc/yum.repos.d/redhat.repo          ◀── Repository definitions       │
+  │  /etc/yum.repos.d/redhat.repo          ◀── Repository definitions        │
   │  ────────────────────────────                                            │
   │  [rhel-9-for-x86_64-baseos-rpms]                                         │
   │  baseurl = https://cdn.redhat.com/...                                    │
@@ -294,13 +294,13 @@ Before DNF can access Red Hat repositories, the system must be registered. This 
   │  sslclientkey = /etc/pki/entitlement/$ID-key.pem                         │
   │  ...                                                                     │
   │                                                                          │
-  │  /etc/pki/consumer/cert.pem            ◀── System identity certificate  │
-  │  /etc/pki/consumer/key.pem             ◀── System identity key          │
+  │  /etc/pki/consumer/cert.pem            ◀── System identity certificate   │
+  │  /etc/pki/consumer/key.pem             ◀── System identity key           │
   │                                                                          │
-  │  /etc/pki/entitlement/$ID.pem          ◀── Subscription entitlement     │
-  │  /etc/pki/entitlement/$ID-key.pem      ◀── Entitlement key              │
+  │  /etc/pki/entitlement/$ID.pem          ◀── Subscription entitlement      │
+  │  /etc/pki/entitlement/$ID-key.pem      ◀── Entitlement key               │
   │                                                                          │
-  │  /etc/rhsm/ca/redhat-uep.pem           ◀── Red Hat CA certificate       │
+  │  /etc/rhsm/ca/redhat-uep.pem           ◀── Red Hat CA certificate        │
   │                                                                          │
   └──────────────────────────────────────────────────────────────────────────┘
              │
@@ -320,10 +320,10 @@ For CentOS, Rocky Linux, AlmaLinux, Fedora:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  CentOS/Rocky/Alma/Fedora: .repo files included in base installation       │
+│  CentOS/Rocky/Alma/Fedora: .repo files included in base installation        │
 │                                                                             │
 │  /etc/yum.repos.d/                                                          │
-│  ├── centos.repo          (or rocky.repo, almalinux.repo, fedora.repo)     │
+│  ├── centos.repo          (or rocky.repo, almalinux.repo, fedora.repo)      │
 │  ├── centos-addons.repo                                                     │
 │  └── ...                                                                    │
 │                                                                             │
@@ -406,10 +406,10 @@ Only happens during: dnf install, dnf update, dnf remove, etc.
 
 ┌────────────────────────────────────────────────────────────┐
 │ Transaction #42                                            │
-│ ──────────────────────────────────────────────────────────│
-│ Package: bash-5.1.8-6.el9.x86_64                          │
+│ ───────────────────────────────────────────────────────────│
+│ Package: bash-5.1.8-6.el9.x86_64                           │
 │ Action:  UPGRADE                                           │
-│ Repo:    rhel-9-baseos      ◀── This is what gets stored  │
+│ Repo:    rhel-9-baseos      ◀── This is what gets stored   │
 │ Reason:  USER                                              │
 └────────────────────────────────────────────────────────────┘
 ```
