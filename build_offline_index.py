@@ -17,28 +17,37 @@
 """
 Offline Index Builder
 
-This script runs on a CONNECTED system (with internet access) and builds a
-compact NEVRA → repository index that can be transferred to an air-gapped system.
-
-The output is a JSON file containing all package identifiers from a repository,
-which can be used by `repo_discovery_offline.py` to determine package origins
-without network access.
+This script builds a compact NEVRA → repository index that can be transferred
+to an air-gapped system for package origin discovery.
 
 Usage:
-    # Build index from a direct URL
+    # Build index from a direct URL (requires network)
     ./build_offline_index.py --baseurl https://mirror.example.com/rhel/9/baseos/x86_64/os/ \\
                              --repo-id rhel-9-baseos \\
                              --output indexes/rhel-9-baseos.json
 
-    # Build index from a .repo file (if it has direct baseurl)
-    ./build_offline_index.py --repo-file /etc/yum.repos.d/myrepo.repo \\
+    # Build index from URLs in a .repo config file (requires network)
+    ./build_offline_index.py --repo-urls-from /etc/yum.repos.d/centos.repo \\
                              --output indexes/
+
+    # Build index from local DNF cache (NO network required!)
+    ./build_offline_index.py --from-cache /var/cache/dnf \\
+                             --output indexes/
+
+    # With variable substitution (for URLs containing $releasever, $basearch)
+    ./build_offline_index.py --repo-urls-from /etc/yum.repos.d/redhat.repo \\
+                             --releasever 9 --basearch x86_64 \\
+                             --output indexes/
+
+    # Disable SSL verification (for self-signed certs or proxies)
+    ./build_offline_index.py --baseurl https://... --repo-id myrepo \\
+                             --insecure --output index.json
 
 Output Format:
     {
         "metadata": {
             "repo_id": "rhel-9-baseos",
-            "baseurl": "https://...",
+            "source": "https://..." or "/var/cache/dnf/...",
             "generated": "2025-01-15T10:30:00",
             "package_count": 1234
         },
@@ -50,15 +59,21 @@ Output Format:
 """
 
 import os
+import re
 import sys
 import json
 import gzip
+import bz2
+import ssl
 import argparse
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from configparser import ConfigParser
+
+# Global SSL context (modified by --insecure flag)
+SSL_CONTEXT = None
 
 # XML namespaces used in repository metadata
 REPO_NS = {'repo': 'http://linux.duke.edu/metadata/repo'}
@@ -72,24 +87,33 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # From a direct URL:
+    # From a direct URL (requires network):
     %(prog)s --baseurl https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/ \\
              --repo-id centos-9-baseos \\
              --output centos-9-baseos.json
 
-    # From a .repo file:
-    %(prog)s --repo-file /etc/yum.repos.d/centos.repo --output indexes/
+    # From a .repo config file (requires network):
+    %(prog)s --repo-urls-from /etc/yum.repos.d/centos.repo --output indexes/
+
+    # From local DNF cache (NO network required):
+    %(prog)s --from-cache /var/cache/dnf --output indexes/
         """
     )
     
     source_group = parser.add_argument_group('Source (choose one)')
     source_group.add_argument(
         '--baseurl',
-        help='Direct URL to the repository (e.g., https://mirror.../os/)'
+        help='Direct URL to the repository (requires network)'
     )
     source_group.add_argument(
-        '--repo-file',
-        help='Path to a .repo file to parse'
+        '--repo-urls-from',
+        metavar='REPO_FILE',
+        help='Parse .repo config file to extract URLs, then download (requires network)'
+    )
+    source_group.add_argument(
+        '--from-cache',
+        metavar='CACHE_DIR',
+        help='Build index from local cache directory (e.g., /var/cache/dnf). NO network required.'
     )
     
     parser.add_argument(
@@ -111,6 +135,19 @@ Examples:
         action='store_true',
         help='Verbose output'
     )
+    parser.add_argument(
+        '--insecure', '-k',
+        action='store_true',
+        help='Disable SSL certificate verification (use with caution)'
+    )
+    parser.add_argument(
+        '--releasever',
+        help='Value to substitute for $releasever in URLs (e.g., 9)'
+    )
+    parser.add_argument(
+        '--basearch',
+        help='Value to substitute for $basearch in URLs (e.g., x86_64)'
+    )
     
     return parser.parse_args()
 
@@ -123,7 +160,7 @@ def download_file(url, verbose=False):
     req = Request(url, headers={'User-Agent': 'offline-index-builder/1.0'})
     
     try:
-        with urlopen(req, timeout=60) as response:
+        with urlopen(req, timeout=60, context=SSL_CONTEXT) as response:
             content = response.read()
             if verbose:
                 print(f"    Downloaded: {len(content)} bytes")
@@ -134,6 +171,15 @@ def download_file(url, verbose=False):
     except URLError as e:
         print(f"    [!] URL Error: {e.reason}")
         return None
+
+
+def substitute_variables(url, releasever=None, basearch=None):
+    """Substitute $releasever and $basearch in URLs."""
+    if releasever:
+        url = url.replace('$releasever', releasever)
+    if basearch:
+        url = url.replace('$basearch', basearch)
+    return url
 
 
 def parse_repomd(repomd_content):
@@ -153,27 +199,9 @@ def parse_primary_xml(primary_content, repo_id, verbose=False):
     """
     Parse primary.xml and extract all package NEVRAs.
     
-    This is the core parsing logic that extracts:
-    - name: package name (e.g., "bash")
-    - epoch: version epoch (usually 0)
-    - version: version string (e.g., "5.1.8")
-    - release: release string (e.g., "6.el9")
-    - arch: architecture (e.g., "x86_64")
-    
     Returns a dict: {nevra_key: repo_id}
     """
     packages = {}
-    
-    # Parse the XML
-    # primary.xml structure:
-    # <metadata>
-    #   <package type="rpm">
-    #     <name>bash</name>
-    #     <arch>x86_64</arch>
-    #     <version epoch="0" ver="5.1.8" rel="6.el9"/>
-    #     ...
-    #   </package>
-    # </metadata>
     
     if verbose:
         print("    Parsing primary.xml...")
@@ -181,15 +209,8 @@ def parse_primary_xml(primary_content, repo_id, verbose=False):
     root = ET.fromstring(primary_content)
     
     # Handle namespaced XML
-    # The root element might be like: <metadata xmlns="http://linux.duke.edu/metadata/common" ...>
-    # We need to handle both namespaced and non-namespaced elements
-    
-    # Try to find the default namespace
-    ns = {'': ''}  # Default empty namespace
     if root.tag.startswith('{'):
-        # Extract namespace from tag like {http://...}metadata
         default_ns = root.tag.split('}')[0] + '}'
-        ns = {'md': default_ns[1:-1]}  # Remove { and }
         pkg_tag = f"{default_ns}package"
         name_tag = f"{default_ns}name"
         arch_tag = f"{default_ns}arch"
@@ -219,7 +240,6 @@ def parse_primary_xml(primary_content, repo_id, verbose=False):
         release = version_elem.get('rel', '')
         
         # Create the NEVRA key: name|epoch|version|release|arch
-        # Using | as delimiter because it's not valid in package names
         nevra_key = f"{name}|{epoch}|{version}|{release}|{arch}"
         
         packages[nevra_key] = repo_id
@@ -234,20 +254,177 @@ def parse_primary_xml(primary_content, repo_id, verbose=False):
     return packages
 
 
+def decompress_file(filepath, content=None):
+    """Decompress a file based on its extension. Returns decompressed content."""
+    if content is None:
+        with open(filepath, 'rb') as f:
+            content = f.read()
+    
+    if filepath.endswith('.gz'):
+        return gzip.decompress(content)
+    elif filepath.endswith('.bz2'):
+        return bz2.decompress(content)
+    elif filepath.endswith('.xz'):
+        import lzma
+        return lzma.decompress(content)
+    else:
+        return content
+
+
+def find_primary_files(cache_dir, verbose=False):
+    """
+    Scan a directory tree for primary.xml.gz or primary.sqlite.bz2 files.
+    
+    Returns a list of tuples: (repo_id, primary_file_path)
+    """
+    found = []
+    
+    if verbose:
+        print(f"[*] Scanning {cache_dir} for metadata files...")
+    
+    for root, dirs, files in os.walk(cache_dir):
+        # Look for repodata directories
+        if 'repodata' in dirs:
+            repodata_path = os.path.join(root, 'repodata')
+            
+            # Try to determine repo_id from directory name
+            # DNF cache format: <repo-id>-<hash>/repodata/
+            parent_dir = os.path.basename(root)
+            
+            # Extract repo_id by removing the hash suffix
+            # Pattern: repo-id-<16 hex chars>
+            match = re.match(r'^(.+)-[a-f0-9]{16}$', parent_dir)
+            if match:
+                repo_id = match.group(1)
+            else:
+                repo_id = parent_dir
+            
+            # Look for primary metadata files
+            for filename in os.listdir(repodata_path):
+                if 'primary' in filename:
+                    if filename.endswith(('.xml.gz', '.xml.xz', '.xml.bz2', '.xml')):
+                        primary_path = os.path.join(repodata_path, filename)
+                        found.append((repo_id, primary_path, 'xml'))
+                        if verbose:
+                            print(f"    Found: {repo_id} -> {primary_path}")
+                        break
+                    elif filename.endswith('.sqlite.bz2') or filename.endswith('.sqlite.gz'):
+                        primary_path = os.path.join(repodata_path, filename)
+                        found.append((repo_id, primary_path, 'sqlite'))
+                        if verbose:
+                            print(f"    Found (sqlite): {repo_id} -> {primary_path}")
+                        break
+    
+    return found
+
+
+def parse_primary_sqlite(db_content, repo_id, verbose=False):
+    """
+    Parse primary.sqlite and extract all package NEVRAs.
+    
+    Returns a dict: {nevra_key: repo_id}
+    """
+    import sqlite3
+    import tempfile
+    
+    packages = {}
+    
+    if verbose:
+        print("    Parsing primary.sqlite...")
+    
+    # Write to temp file (sqlite3 requires a file)
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.sqlite') as tmp:
+        tmp.write(db_content)
+        tmp_path = tmp.name
+    
+    try:
+        conn = sqlite3.connect(tmp_path)
+        cursor = conn.cursor()
+        
+        # Query all packages
+        cursor.execute("SELECT name, epoch, version, release, arch FROM packages")
+        
+        count = 0
+        for row in cursor:
+            name, epoch, version, release, arch = row
+            epoch = epoch if epoch else '0'
+            
+            nevra_key = f"{name}|{epoch}|{version}|{release}|{arch}"
+            packages[nevra_key] = repo_id
+            count += 1
+        
+        conn.close()
+        
+        if verbose:
+            print(f"    Total packages found: {count}")
+    
+    finally:
+        os.unlink(tmp_path)
+    
+    return packages
+
+
+def build_index_from_cache(cache_dir, verbose=False):
+    """
+    Build indexes from a local cache directory (e.g., /var/cache/dnf).
+    
+    Returns a list of index dicts.
+    """
+    indexes = []
+    
+    primary_files = find_primary_files(cache_dir, verbose)
+    
+    if not primary_files:
+        print(f"[!] No primary metadata files found in {cache_dir}")
+        print("    Make sure the directory contains DNF cache data.")
+        print("    Expected structure: <cache_dir>/<repo-id>-<hash>/repodata/")
+        return []
+    
+    print(f"[*] Found {len(primary_files)} repository metadata files")
+    
+    for repo_id, primary_path, file_type in primary_files:
+        print(f"\n[*] Building index for: {repo_id}")
+        print(f"    Source: {primary_path}")
+        
+        try:
+            # Read and decompress
+            print("    Decompressing...")
+            primary_content = decompress_file(primary_path)
+            
+            # Parse based on file type
+            print("    Parsing package list...")
+            if file_type == 'xml':
+                packages = parse_primary_xml(primary_content, repo_id, verbose)
+            else:  # sqlite
+                packages = parse_primary_sqlite(primary_content, repo_id, verbose)
+            
+            index = {
+                "metadata": {
+                    "repo_id": repo_id,
+                    "source": primary_path,
+                    "generated": datetime.utcnow().isoformat(),
+                    "package_count": len(packages)
+                },
+                "packages": packages
+            }
+            
+            indexes.append(index)
+            print(f"    Packages indexed: {len(packages)}")
+            
+        except Exception as e:
+            print(f"[!] Error processing {repo_id}: {e}")
+            continue
+    
+    return indexes
+
+
 def build_index_from_url(baseurl, repo_id, verbose=False):
     """
     Build a NEVRA index from a repository URL.
-    
-    Steps:
-    1. Download repomd.xml to find primary metadata location
-    2. Download primary.xml.gz
-    3. Parse and extract all package NEVRAs
-    4. Return as structured dict
     """
     print(f"\n[*] Building index for: {repo_id}")
     print(f"    Base URL: {baseurl}")
     
-    # Normalize URL
     baseurl = baseurl.rstrip('/')
     
     # Step 1: Download repomd.xml
@@ -259,7 +436,7 @@ def build_index_from_url(baseurl, repo_id, verbose=False):
         print("[!] Failed to download repomd.xml")
         return None
     
-    # Step 2: Parse repomd.xml to find primary metadata
+    # Step 2: Parse repomd.xml
     print("\n[*] Step 2: Parsing repomd.xml...")
     primary_location = parse_repomd(repomd_content)
     
@@ -278,33 +455,18 @@ def build_index_from_url(baseurl, repo_id, verbose=False):
         print("[!] Failed to download primary metadata")
         return None
     
-    # Step 4: Decompress if needed
+    # Step 4: Decompress
     print("\n[*] Step 4: Decompressing metadata...")
-    if primary_location.endswith('.gz'):
-        try:
-            primary_content = gzip.decompress(primary_compressed)
-        except Exception as e:
-            print(f"[!] Failed to decompress: {e}")
-            return None
-    elif primary_location.endswith('.xz'):
-        try:
-            import lzma
-            primary_content = lzma.decompress(primary_compressed)
-        except ImportError:
-            print("[!] lzma module not available for .xz decompression")
-            return None
-    else:
-        primary_content = primary_compressed
+    primary_content = decompress_file(primary_location, primary_compressed)
     
-    # Step 5: Parse primary.xml
+    # Step 5: Parse
     print("\n[*] Step 5: Parsing package list...")
     packages = parse_primary_xml(primary_content, repo_id, verbose)
     
-    # Build the final index structure
     index = {
         "metadata": {
             "repo_id": repo_id,
-            "baseurl": baseurl,
+            "source": baseurl,
             "generated": datetime.utcnow().isoformat(),
             "package_count": len(packages)
         },
@@ -325,7 +487,6 @@ def parse_repo_file(repo_file_path):
         enabled = config.getboolean(section, 'enabled', fallback=True)
         
         if baseurl and enabled:
-            # Handle multi-line baseurls
             urls = baseurl.strip().split('\n')
             repos[section] = urls[0].strip()
     
@@ -338,7 +499,7 @@ def save_index(index, output_path, compress=False):
         if not output_path.endswith('.gz'):
             output_path += '.gz'
         with gzip.open(output_path, 'wt', encoding='utf-8') as f:
-            json.dump(index, f, separators=(',', ':'))  # Compact JSON
+            json.dump(index, f, separators=(',', ':'))
     else:
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(index, f, indent=2)
@@ -347,62 +508,106 @@ def save_index(index, output_path, compress=False):
 
 
 def main():
+    global SSL_CONTEXT
+    
     args = parse_args()
     
     print("=" * 70)
     print("Offline Index Builder")
     print("=" * 70)
     
-    indexes_to_build = []  # List of (repo_id, baseurl)
+    # Set up SSL context if --insecure is specified
+    if args.insecure:
+        print("\n[!] WARNING: SSL certificate verification is DISABLED")
+        SSL_CONTEXT = ssl.create_default_context()
+        SSL_CONTEXT.check_hostname = False
+        SSL_CONTEXT.verify_mode = ssl.CERT_NONE
     
-    if args.baseurl:
+    indexes = []
+    
+    # === SOURCE: Local Cache ===
+    if args.from_cache:
+        if not os.path.isdir(args.from_cache):
+            print(f"[!] Cache directory not found: {args.from_cache}")
+            sys.exit(1)
+        
+        print(f"\n[*] Building indexes from local cache: {args.from_cache}")
+        print("    (No network access required)")
+        
+        indexes = build_index_from_cache(args.from_cache, args.verbose)
+    
+    # === SOURCE: Direct URL ===
+    elif args.baseurl:
         if not args.repo_id:
             print("[!] --repo-id is required when using --baseurl")
             sys.exit(1)
-        indexes_to_build.append((args.repo_id, args.baseurl))
+        
+        if args.releasever:
+            print(f"[*] Using releasever: {args.releasever}")
+        if args.basearch:
+            print(f"[*] Using basearch: {args.basearch}")
+        
+        baseurl = substitute_variables(args.baseurl, args.releasever, args.basearch)
+        index = build_index_from_url(baseurl, args.repo_id, args.verbose)
+        if index:
+            indexes.append(index)
     
-    elif args.repo_file:
-        if not os.path.exists(args.repo_file):
-            print(f"[!] Repo file not found: {args.repo_file}")
+    # === SOURCE: .repo Config File ===
+    elif args.repo_urls_from:
+        if not os.path.exists(args.repo_urls_from):
+            print(f"[!] Repo file not found: {args.repo_urls_from}")
             sys.exit(1)
         
-        repos = parse_repo_file(args.repo_file)
+        print(f"\n[*] Parsing repo config: {args.repo_urls_from}")
+        print("    (Will download from extracted URLs - network required)")
+        
+        if args.releasever:
+            print(f"[*] Using releasever: {args.releasever}")
+        if args.basearch:
+            print(f"[*] Using basearch: {args.basearch}")
+        
+        repos = parse_repo_file(args.repo_urls_from)
         if not repos:
             print("[!] No enabled repositories with baseurl found in .repo file")
             print("    Note: metalink/mirrorlist URLs are not supported.")
             sys.exit(1)
         
         for repo_id, baseurl in repos.items():
-            indexes_to_build.append((repo_id, baseurl))
+            baseurl = substitute_variables(baseurl, args.releasever, args.basearch)
+            if '$' in baseurl:
+                print(f"\n[!] WARNING: URL for {repo_id} contains unsubstituted variables:")
+                print(f"    {baseurl}")
+                print(f"    Use --releasever and/or --basearch to substitute them.")
+                continue
+            
+            index = build_index_from_url(baseurl, repo_id, args.verbose)
+            if index:
+                indexes.append(index)
     
     else:
-        print("[!] Either --baseurl or --repo-file is required")
+        print("[!] One of --baseurl, --repo-urls-from, or --from-cache is required")
         sys.exit(1)
     
-    # Build indexes
-    for repo_id, baseurl in indexes_to_build:
-        index = build_index_from_url(baseurl, repo_id, args.verbose)
+    # === Save Indexes ===
+    if not indexes:
+        print("\n[!] No indexes were built")
+        sys.exit(1)
+    
+    for index in indexes:
+        repo_id = index['metadata']['repo_id']
         
-        if not index:
-            print(f"\n[!] Failed to build index for {repo_id}")
-            continue
-        
-        # Determine output path
         if os.path.isdir(args.output):
             output_path = os.path.join(args.output, f"{repo_id}.json")
         else:
             output_path = args.output
         
-        # Ensure output directory exists
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
         
-        # Save the index
         final_path = save_index(index, output_path, args.compress)
         
         print(f"\n[✓] Index saved: {final_path}")
         print(f"    Packages indexed: {index['metadata']['package_count']}")
         
-        # Show file size
         size = os.path.getsize(final_path)
         if size > 1024 * 1024:
             print(f"    File size: {size / 1024 / 1024:.1f} MB")
@@ -417,4 +622,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

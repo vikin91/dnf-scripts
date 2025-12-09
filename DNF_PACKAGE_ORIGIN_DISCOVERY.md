@@ -6,12 +6,14 @@ This document explains how DNF identifies which repository a package was install
 
 1. [Overview](#overview)
 2. [Key Concepts](#key-concepts)
-3. [The Sack: DNF's In-Memory Search Engine](#the-sack-dnfs-in-memory-search-engine)
-4. [How DNF Matches Packages to Repositories](#how-dnf-matches-packages-to-repositories)
-5. [Where the Data Lives on Disk](#where-the-data-lives-on-disk)
-6. [The History Database (history.sqlite)](#the-history-database-historysqlite)
-7. [Manual Tracing: Finding Package Origin Yourself](#manual-tracing-finding-package-origin-yourself)
-8. [Programmatic Discovery](#programmatic-discovery)
+3. [The .repo File: Configuration, Not Data](#the-repo-file-configuration-not-data)
+4. [Red Hat CDN Authentication](#red-hat-cdn-authentication)
+5. [The Sack: DNF's In-Memory Search Engine](#the-sack-dnfs-in-memory-search-engine)
+6. [How DNF Matches Packages to Repositories](#how-dnf-matches-packages-to-repositories)
+7. [Where the Data Lives on Disk](#where-the-data-lives-on-disk)
+8. [The History Database (history.sqlite)](#the-history-database-historysqlite)
+9. [Manual Tracing: Finding Package Origin Yourself](#manual-tracing-finding-package-origin-yourself)
+10. [Programmatic Discovery](#programmatic-discovery)
 
 ---
 
@@ -42,6 +44,156 @@ This document explains exactly how that matching works.
 | **Repository Metadata** | XML/SQLite files downloaded from remote repos containing package catalogs. |
 | **history.sqlite** | SQLite database at `/var/lib/dnf/history.sqlite` storing transaction history. |
 | **libdnf** | The C++ library that powers DNF's core functionality (including the Sack). |
+| **.repo file** | Configuration file in `/etc/yum.repos.d/` that tells DNF where to find repositories. |
+
+---
+
+## The .repo File: Configuration, Not Data
+
+A common misconception is that `.repo` files contain repository data. They don't — they contain **configuration** that tells DNF where to find the actual data.
+
+### Location
+
+```
+/etc/yum.repos.d/*.repo
+```
+
+### What's Inside
+
+```ini
+[rhel-9-for-x86_64-baseos-rpms]
+name = Red Hat Enterprise Linux 9 for x86_64 - BaseOS (RPMs)
+baseurl = https://cdn.redhat.com/content/dist/rhel9/$releasever/x86_64/baseos/os
+enabled = 1
+gpgcheck = 1
+gpgkey = file:///etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release
+sslcacert = /etc/rhsm/ca/redhat-uep.pem
+sslclientkey = /etc/pki/entitlement/*-key.pem
+sslclientcert = /etc/pki/entitlement/*.pem
+```
+
+### Key Fields
+
+| Field | Purpose |
+|-------|---------|
+| `[section-name]` | Repository ID (e.g., `rhel-9-for-x86_64-baseos-rpms`) |
+| `baseurl` | URL where the repository metadata and packages live |
+| `metalink` | Alternative to baseurl; URL that returns a list of mirrors |
+| `mirrorlist` | Alternative to baseurl; URL that returns mirror URLs |
+| `enabled` | Whether this repo is active (1) or disabled (0) |
+| `gpgcheck` | Whether to verify package signatures |
+| `sslclientcert` | Client certificate for authentication (Red Hat CDN) |
+| `sslclientkey` | Client key for authentication (Red Hat CDN) |
+
+### Important: Variables in URLs
+
+URLs often contain variables that DNF substitutes at runtime:
+
+| Variable | Source | Example Value |
+|----------|--------|---------------|
+| `$releasever` | `/etc/os-release` or RPM | `9` |
+| `$basearch` | System architecture | `x86_64` |
+
+Example transformation:
+```
+Config:   https://cdn.redhat.com/.../rhel9/$releasever/$basearch/baseos/os
+Resolved: https://cdn.redhat.com/.../rhel9/9/x86_64/baseos/os
+```
+
+### The .repo File is Just a Pointer
+
+```
+┌─────────────────────────────────────┐
+│  /etc/yum.repos.d/redhat.repo       │
+│  ─────────────────────────────────  │
+│  baseurl = https://cdn.redhat.com/..│  ← Just a URL (pointer)
+└─────────────────────────────────────┘
+                 │
+                 │  DNF follows this URL
+                 ▼
+┌─────────────────────────────────────┐
+│  Remote Repository                  │
+│  ─────────────────────────────────  │
+│  repodata/repomd.xml                │  ← Actual metadata
+│  repodata/*-primary.xml.gz          │  ← Package catalog
+│  Packages/*.rpm                     │  ← Actual packages
+└─────────────────────────────────────┘
+```
+
+---
+
+## Red Hat CDN Authentication
+
+Red Hat's Content Delivery Network (`cdn.redhat.com`) is **not publicly accessible**. It requires client certificate authentication tied to a valid Red Hat subscription.
+
+### Why Downloads Fail Without Authentication
+
+If you try to download directly from `cdn.redhat.com`:
+
+```bash
+curl https://cdn.redhat.com/content/dist/rhel9/9/x86_64/baseos/os/repodata/repomd.xml
+# Result: 403 Forbidden
+```
+
+### How DNF Authenticates
+
+When you register a RHEL system with `subscription-manager`, it provisions:
+
+| File | Purpose |
+|------|---------|
+| `/etc/pki/consumer/cert.pem` | Identifies the registered system |
+| `/etc/pki/consumer/key.pem` | Private key for the consumer cert |
+| `/etc/pki/entitlement/*.pem` | Proves subscription entitlement |
+| `/etc/rhsm/ca/redhat-uep.pem` | Red Hat's CA certificate |
+
+DNF (via libdnf → librepo → libcurl) automatically uses these certificates when connecting to Red Hat URLs.
+
+### The Authentication Flow
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                         DNF                                 │
+│                          │                                  │
+│                          ▼                                  │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ libdnf reads .repo file                             │   │
+│  │ Sees: sslclientcert = /etc/pki/entitlement/*.pem    │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                          │                                  │
+│                          ▼                                  │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ librepo/libcurl establishes HTTPS connection        │   │
+│  │ Presents client certificate to cdn.redhat.com       │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                          │                                  │
+│                          ▼                                  │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ Red Hat CDN validates certificate                   │   │
+│  │ Checks subscription entitlements                    │   │
+│  │ Returns: 200 OK + metadata                          │   │
+│  └─────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Implications for Custom Scripts
+
+If you write a script that downloads from `cdn.redhat.com` without providing client certificates, you'll get `403 Forbidden`.
+
+**Options:**
+
+1. **Use DNF to download metadata first** (`dnf makecache`), then read from local cache
+2. **Use public mirrors** (CentOS Stream, Rocky Linux, AlmaLinux) for testing
+3. **Add certificate support** to your script (complex)
+
+### Public Alternatives (No Authentication Required)
+
+These RHEL-compatible distributions have public mirrors:
+
+| Distribution | Base URL Example |
+|--------------|------------------|
+| CentOS Stream 9 | `https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/` |
+| Rocky Linux 9 | `https://download.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/` |
+| AlmaLinux 9 | `https://repo.almalinux.org/almalinux/9/BaseOS/x86_64/os/` |
 
 ---
 
