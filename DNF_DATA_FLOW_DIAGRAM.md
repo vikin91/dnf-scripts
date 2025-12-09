@@ -102,18 +102,20 @@ flowchart TB
     TRANS_ITEMS --> TRANS_END
     TRANS_END -->|"persists"| HISTORY_DB
 
-    %% Styling
-    classDef remote fill:#e1f5fe,stroke:#01579b
-    classDef config fill:#fff3e0,stroke:#e65100
-    classDef cache fill:#e8f5e9,stroke:#2e7d32
-    classDef memory fill:#f3e5f5,stroke:#7b1fa2
-    classDef db fill:#fce4ec,stroke:#c2185b
+    %% Styling with high-contrast colors for Dark/Light mode compatibility
+    classDef remote fill:#bbdefb,stroke:#0d47a1,stroke-width:2px,color:#000
+    classDef config fill:#ffe0b2,stroke:#e65100,stroke-width:2px,color:#000
+    classDef cache fill:#c8e6c9,stroke:#1b5e20,stroke-width:2px,color:#000
+    classDef memory fill:#e1bee7,stroke:#4a148c,stroke-width:2px,color:#000
+    classDef db fill:#f8bbd0,stroke:#880e4f,stroke-width:2px,color:#000
+    classDef auth fill:#ffccbc,stroke:#bf360c,stroke-width:2px,color:#000
 
     class CDN,REPOMD,PRIMARY,RPMS remote
     class REPOFILE,CERTS config
     class CACHE_DIR,LOCAL_REPOMD,LOCAL_PRIMARY cache
     class FILL_SACK,AVAILABLE,SYSTEM,MATCH memory
     class HISTORY_DB,TRANS_TABLE,RPM_TABLE,ITEM_TABLE db
+    class REGISTER,RHSM,SUBMGR auth
 ```
 
 ---
